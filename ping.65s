@@ -1,0 +1,1415 @@
+
+;---------------------------------------------------------------------
+; PING - an arcade game for the OSI Superboard 2 (OSI 600).
+;
+; Written by David Nelson, April 2022.
+; Released under GPL 3.0
+;---------------------------------------------------------------------
+; Compiles using Michal Kowalski's 6502 assembler:
+; https://sbc.rictor.org/kowalski.html
+;---------------------------------------------------------------------
+; Requires 48 x 32 screen upgrade to function as-is.
+;
+; For other screen sizes some of the constants (immediately
+; below) will need to be altered.
+;
+; For other 6502 machines the only other bits that will really need 
+; to be changed are:
+; - the load and screen RAM addresses
+; - the keyboard polling routine (p400), as the routine here is specific to the OSI 600
+; - the graphic characters used to build the display.
+;
+; To adjust the speed of the game, change the value stored in Y
+; in the delay routine (p199). A value of 6 gives a 
+; reasonable pace for a 1 MHz computer. Higher = slower.
+;
+;---------------------------------------------------------------------
+
+;------------------------- OSI 600-specific constants ---------
+
+SCRN_MEM_START_ADDR = $D000		; Address of first byte of screen RAM
+SCRN_VIS_START_ADDR = $D000		; Address of first visible (top LH) screen cell			(24 x 24: $D085)
+SCRN_MEM_END_ADDR = $D800		; One more than the address of the final byte of screen RAM 	(24 x 24: $D400)
+SCRN_VIS_END_ADDR = $D800		; Address of first byte of first non-visible line of screen RAN (24 x 24: $D385)
+KEYB_POLL_ADDR = $DF00			; Address to poll for keyboard input
+
+SCRN_MEM_CELLS_WIDE = 64		; RAM locations per row						(24 x 24: 32)
+SCRN_VIS_CELLS_WIDE = 48		; Cells per row visible on screem				(24 x 24: 24)
+SCRN_MEM_CELLS_HIGH = 32		; Total 'height' of screen RAM, including off-screen part	(24 x 24: 32)		
+SCRN_VIS_CELLS_HIGH = 32		; Height of visible screen area					(24 x 24: 24)
+
+; OSI graphic characters. These are used to determine what the ball does when it contacts
+; other objects on the screen. Altering any two to the same value will cause problems!
+NUM_GRAPHIC_1 = 187				
+NUM_GRAPHIC_0 = 32	
+WALL_GRAPHIC = 161
+CENTRE_LINE_GRAPHIC = 125
+BAT_1_GRAPHIC = 157 
+BAT_2_GRAPHIC = 156
+GOAL_1_GRAPHIC = 138
+GOAL_2_GRAPHIC = 141 
+
+; To make ball movement (a little) smoother, the ball is drawn as either one whole
+; circle, two half-circles or four quarter-circles, effectively moving half a cell 
+; at a time. See "The Challenger Character Graphics Reference Manual", p.25.
+BALL_WHOLE_GRAPHIC = 226		; full circle
+BALL_LH_GRAPHIC = 224			; two half-circles for horizontal movement
+BALL_RH_GRAPHIC = 225	
+BALL_Q1_GRAPHIC = 221			; four quarter-circles for diagonal movement
+BALL_Q2_GRAPHIC = 222
+BALL_Q3_GRAPHIC = 220
+BALL_Q4_GRAPHIC = 223
+
+; Constants for OSI 600 keybard polling. See "The Challenger Character Graphics Reference Manual", p.12,
+; for explanation about the row/column scan.
+LH_BAT_UP_ASC = 81	; Q
+LH_BAT_UP_ROW = 253
+LH_BAT_UP_COL = 127
+LH_BAT_DOWN_ASC = 65	; A
+LH_BAT_DOWN_ROW = 253
+LH_BAT_DOWN_COL = 191
+RH_BAT_UP_ASC = 80	; P
+RH_BAT_UP_ROW = 253
+RH_BAT_UP_COL = 253
+RH_BAT_DOWN_ASC = 76	; L
+RH_BAT_DOWN_ROW = 223
+RH_BAT_DOWN_COL = 191
+
+;------------------------- OSI 600-specific constants END -----
+
+BAT_SIZE = 2				; Number of cells above and below bat's start cell, so e.g. 2 implies total bat size of 5
+BAT_INDENT = 4				; Indent from edges of screen. Do not make this 2 or 3, as ball can become stuck behind bat
+MAX_SCORE = 12				; Set for reasonable length of game
+
+NUM_DISP_DIGITS = 2			; Max number of 'graphical' digits to display in score
+NUM_CELLS_WIDE = 4			; Width of each graphical digit, in cells
+SCRN_ROWS_FOR_NUMS = 6			; number of screen rows used for digits, including one blank row
+
+PLAY_AREA_HEIGHT = SCRN_VIS_CELLS_HIGH - 2	; Divide the play area horizontally roughly into thirds, with the 'goals' 
+UPPER_WALL_HEIGHT = PLAY_AREA_HEIGHT / 3	; occupying the middle third
+LOWER_WALL_HEIGHT = PLAY_AREA_HEIGHT / 3
+GOAL_HEIGHT = PLAY_AREA_HEIGHT - UPPER_WALL_HEIGHT - LOWER_WALL_HEIGHT
+UPPER_WALL_START_ADDR = SCRN_VIS_START_ADDR 			; Top LH corner of wall - set to top LH corner of screen
+PLAY_MEM_LENGTH = SCRN_VIS_END_ADDR - UPPER_WALL_START_ADDR	; Length in bytes of screen RAM used for play area 
+PLAY_CENTRE_ADDR = UPPER_WALL_START_ADDR + SCRN_MEM_CELLS_WIDE * PLAY_AREA_HEIGHT / 2 + SCRN_VIS_CELLS_WIDE / 2	; 'Centre spot' from which ball starts game
+CENTRE_LINE_START_ADDR = UPPER_WALL_START_ADDR + SCRN_MEM_CELLS_WIDE + SCRN_VIS_CELLS_WIDE / 2	; Start cell of dashed vertical centre line
+
+; Starting point for drawing lower wall: immediately below the LH goal
+LOWER_WALL_START_OFFSET_ROWS = 1 + UPPER_WALL_HEIGHT + GOAL_HEIGHT
+LOWER_WALL_START_ADDR = UPPER_WALL_START_ADDR + SCRN_MEM_CELLS_WIDE * LOWER_WALL_START_OFFSET_ROWS
+
+; Position the two scores approximately 1/4 and 3/4 of the way across, allowing for the number of digits to display
+NUM1_START_ADDR = SCRN_VIS_START_ADDR + SCRN_MEM_CELLS_WIDE * 2 + SCRN_VIS_CELLS_WIDE / 4 - NUM_DISP_DIGITS * NUM_CELLS_WIDE / 2 - 1
+NUM2_START_ADDR = SCRN_VIS_START_ADDR + SCRN_MEM_CELLS_WIDE * 2 + SCRN_VIS_CELLS_WIDE *3/4 - NUM_DISP_DIGITS * NUM_CELLS_WIDE /2 - 1
+
+; Starting point for centre cell of bats. Each bat is drawn from this cell, above and below, to the extent
+; stored in BAT_SIZE.
+LH_BAT_START_ADDR = SCRN_VIS_START_ADDR + PLAY_MEM_LENGTH / 2 + BAT_INDENT
+RH_BAT_START_ADDR = SCRN_VIS_START_ADDR + PLAY_MEM_LENGTH / 2 + SCRN_VIS_CELLS_WIDE - BAT_INDENT - 1
+
+; The extremes to which each bat can travel before conflicting with the walls.
+LH_BAT_MIN_ADDR = UPPER_WALL_START_ADDR + SCRN_MEM_CELLS_WIDE * BAT_SIZE + SCRN_MEM_CELLS_WIDE + BAT_INDENT
+LH_BAT_MAX_ADDR = SCRN_VIS_END_ADDR - SCRN_MEM_CELLS_WIDE * BAT_SIZE - SCRN_MEM_CELLS_WIDE * 2 + BAT_INDENT
+RH_BAT_MIN_ADDR = LH_BAT_MIN_ADDR + SCRN_VIS_CELLS_WIDE - BAT_INDENT * 2 - 1
+RH_BAT_MAX_ADDR = LH_BAT_MAX_ADDR + SCRN_VIS_CELLS_WIDE - BAT_INDENT * 2 - 1
+
+; Location of messages displayed before and after game
+SPLASH_START_ADDR = UPPER_WALL_START_ADDR + SCRN_MEM_CELLS_WIDE * UPPER_WALL_HEIGHT + SCRN_VIS_CELLS_WIDE / 2 - 2 * NUM_CELLS_WIDE - 2
+SPLASH_MSG_START_ADDR = SPLASH_START_ADDR + SCRN_MEM_CELLS_WIDE * SCRN_ROWS_FOR_NUMS -1
+
+GAME_OVER_START_ADDR1 = UPPER_WALL_START_ADDR + SCRN_MEM_CELLS_WIDE + SCRN_MEM_CELLS_WIDE * UPPER_WALL_HEIGHT + SCRN_VIS_CELLS_WIDE / 2 - 2 * NUM_CELLS_WIDE - 2
+GAME_OVER_START_ADDR2 = GAME_OVER_START_ADDR1 + SCRN_MEM_CELLS_WIDE * SCRN_ROWS_FOR_NUMS
+INSTR_MSG_START_ADDR = GAME_OVER_START_ADDR2 + SCRN_MEM_CELLS_WIDE * SCRN_ROWS_FOR_NUMS 
+
+;------------- ZERO PAGE STORAGE -----------------
+
+MEMZP = $00
+dividend = MEMZP + $00
+divisor  = MEMZP + $01
+quotient = MEMZP + $02
+remainder = MEMZP + $03
+scr = MEMZP + $04		; current screen address
+scr2 = MEMZP + $06		; copy of address
+bScr = MEMZP + $08		; screen address for ball
+bScr2 = MEMZP + $0A		; copy of address for ball
+t1Scr = MEMZP + $0C		; screen address for bat 1
+t2Scr = MEMZP + $0E		; screen address for bat 2
+tScr = MEMZP + $10		; screen address for bat while being drawn
+tScr2 = MEMZP + $12		; copy of address
+ballSwap = MEMZP + $14		; swap for background behind ball, init to 32
+numBallCells = MEMZP + $18	; 1, 2 or 4
+traj = MEMZP + $19		; trajectory type: number of horizontal moves per vertical move
+vDir = MEMZP + $1A		; vertical direction: down = 0, up = 64
+hDir = MEMZP + $1B		; horizontal direction: right = 0, left = 1
+currTraj = MEMZP + $1C		; current horizontal step of trajectory
+num1 = MEMZP + $1D		; LH player score
+num2 = MEMZP + $1E		; RH player score
+rnd  = MEMZP + $1F		; random number seed / value init to 1
+blockIndex = MEMZP + $20	; value of digit (0 - 9) to be displayed graphically
+numValue = MEMZP + $21 		; value	of score (0 - whatever) to be displayed graphically
+batSize	 = MEMZP + $22		; number of cells, above and below bat start cell, to which bat extends
+batGraphic = MEMZP + $23	; populated by graphic character value prior to displaying a bat, or 32 to blank one out
+checkFlags = MEMZP + $24	; flags to be checked after each inspoction of proposed ball move
+numOfWallCells = MEMZP + $25 	; used when checking legality of proposed ball move
+
+;------------- ZERO PAGE STORAGE END -------------
+
+;------------- START OF ASSEMBLY CODE ------------
+	*=$0300
+	nop
+	nop
+	nop
+	jsr clearScr
+	jsr splashGraphic
+	jsr showSplashMsg
+	jsr showInstrMsg
+standbyLoop:
+	jsr keybPoll
+	;ldx #32			; #### TODO: remove after testing!
+standbyTryRubOut:
+	cpx #95			; was Rub Out pressed?
+	bne standbyTrySpace	; no: jump to next test
+	rts			; end program
+standbyTrySpace:
+	cpx #32			; was space pressed?
+	bne standbyLoop		; no: jump  back to loop
+	jsr initPlayArea
+	jsr startPlay
+playLoop:
+playCheckScores:
+	lda num1		; get LH player score
+	cmp #MAX_SCORE
+	bne playNum1OK
+	jmp gameOver
+playNum1OK:
+	lda num2		; get RH player score
+	cmp #MAX_SCORE
+	bne playNum2OK
+	jmp gameOver
+playNum2OK:
+	jsr ballLoop
+	jmp playLoop
+
+gameOver:
+	jsr gameOverGraphic
+	jsr showInstrMsg
+	jmp standbyLoop
+	
+;---------------------------------------------
+; p005: splash: title page
+splashGraphic:
+	lda #<SPLASH_START_ADDR
+	sta scr
+	sta scr2
+	lda #>SPLASH_START_ADDR
+	sta scr+1
+	sta scr2+1
+	lda #11			; index of first graphics block to display
+	sta blockIndex
+	ldx #5			; number of blocks to display
+	jsr dispGraphic
+splashGraphicOut:
+	rts
+
+;---------------------------------------------
+; p010: dispGraphic: display a series of graphic 'blocks'
+; representing chunky text characters. On calling, X
+; must contain number of blocks and A the index of the first one.
+dispGraphic:
+p010Loop:
+	jsr dispBlock
+	lda scr2		; prepare to update the screen address from the copy
+	clc
+	adc #NUM_CELLS_WIDE	; move to space for next digit
+	sta scr			; update the screen address and the copy
+	sta scr2	
+	lda scr2+1
+	adc #0
+	sta scr+1
+	sta scr2+1
+	inc blockIndex
+	dex
+	bne p010Loop
+dispGraphicOut:
+	rts
+
+;---------------------------------------------
+; p011: gameOverGraphic: show graphic message
+gameOverGraphic:
+	lda #<GAME_OVER_START_ADDR1
+	sta scr
+	sta scr2
+	lda #>GAME_OVER_START_ADDR1
+	sta scr+1
+	sta scr2+1
+	lda #16			; index of first graphics block to display
+	sta blockIndex
+	ldx #5			; number of blocks to display
+	jsr dispGraphic
+	lda #<GAME_OVER_START_ADDR2
+	sta scr
+	sta scr2
+	lda #>GAME_OVER_START_ADDR2
+	sta scr+1
+	sta scr2+1
+	lda #21			; index of second graphics block to display
+	sta blockIndex
+	ldx #5			; number of blocks to display
+	jsr dispGraphic
+gameOverGraphicOut:
+	rts	
+
+;---------------------------------------------
+; p012: showSplashMsg
+showSplashMsg:
+	lda #<SPLASH_MSG_START_ADDR
+	sta scr
+	lda #>SPLASH_MSG_START_ADDR
+	sta scr+1
+	ldy #0
+p012Loop:
+	lda splashMsg, Y
+	beq showSplashMsgOut
+	sta (scr), y
+	iny
+	jmp p012Loop
+showSplashMsgOut:
+	rts
+
+;---------------------------------------------
+; p014: showInstrMsg
+showInstrMsg:
+	lda #<INSTR_MSG_START_ADDR
+	sta scr
+	lda #>INSTR_MSG_START_ADDR
+	sta scr+1
+	ldy #0
+p014Loop:
+	lda instrMsg, Y
+	beq showInstrMsgOut
+	sta (scr), y
+	iny
+	jmp p014Loop
+showInstrMsgOut:
+	rts
+	
+	
+;---------------------------------------------
+; p020: initPlayArea: prepare screen for play
+initPlayArea:
+	jsr clearScr
+	jsr drawWalls
+	lda #32			; initialise all variables
+	sta ballSwap
+	sta ballSwap+1
+	sta ballSwap+2
+	sta ballSwap+3
+	lda #2 
+	sta batSize
+	lda #1
+	sta rnd
+	
+	lda #<LH_BAT_START_ADDR
+	sta t1Scr
+	lda #>LH_BAT_START_ADDR
+	sta t1Scr+1
+	ldx #1
+	jsr drawBat1
+	
+	lda #<RH_BAT_START_ADDR
+	sta t2Scr
+	lda #>RH_BAT_START_ADDR
+	sta t2Scr+1
+	ldx #1
+	jsr drawBat2
+	
+	lda #0
+	sta num1
+	sta numValue
+	lda #<NUM1_START_ADDR
+	sta scr
+	lda #>NUM1_START_ADDR
+	sta scr+1
+	jsr dispNumber
+	lda #0
+	sta num2
+	sta numValue
+	lda #<NUM2_START_ADDR
+	sta scr
+	lda #>NUM2_START_ADDR
+	sta scr+1
+	jsr dispNumber
+initPlayAreaOut:
+	rts
+
+;---------------------------------------------
+; p040: startPlay: initialises play at start of
+; game or after a goal is scored
+startPlay:
+	jsr setTraj		; choose a trajectory for the ball
+p040SetHDir:
+	lda rnd			; retrieve random number
+	and #8			; is bit 3 set?
+	beq p040Bit3Clear 	; no: jump out
+	lda #1
+	sta hDir		; set ball to travel left on starting
+	jmp p040PlaceBall
+p040Bit3Clear:	
+	lda #0
+	sta hDir		; set ball to travel right on starting	
+p040PlaceBall:
+	lda #1
+	sta numBallCells	; reset ball to a single character
+	lda #<PLAY_CENTRE_ADDR
+	sta bScr
+	lda #>PLAY_CENTRE_ADDR
+	sta bScr+1		; place ball in middle of screen
+	jsr drawBall1
+startPlayOut:
+    	rts
+    	
+;---------------------------------------------
+; p050: setTraj: initialises ball trajectory after
+; ball has hit a bat
+setTraj:
+	jsr genRandom		; create a pseudo-random number
+    	and #7	 		; get value 0 - 7
+    	sta traj		; store as trajectory (up to 7 horizontal moves for one vertical move)
+
+p050SetVDir:
+	lda rnd			; retrieve random number
+	and #16			; is bit 4 set?
+	beq p050Bit4Clear 	; no: jump out
+	lda #SCRN_MEM_CELLS_WIDE
+	sta vDir		; set ball to travel upwards on starting
+	jmp setTrajOut
+p050Bit4Clear:	
+	lda #0
+	sta vDir		; set ball to travel downwards on starting
+setTrajOut:
+	rts
+
+;---------------------------------------------
+; p060: genRandom: create a pseudo-random number
+genRandom:
+   	lda rnd
+   	asl          		; Multiply rnd by 5
+   	asl          
+    	clc
+   	adc rnd      
+    	clc			
+    	adc #17      		; add 17
+        sta rnd
+genRandomOut:
+	rts
+
+;---------------------------------------------
+; p070: clearScr: clears screen
+clearScr:
+	lda #<SCRN_MEM_START_ADDR	; reset screen start point
+	sta scr
+	lda #>SCRN_MEM_START_ADDR
+	sta scr+1
+	ldy #$00		; index from start of screem
+	lda #$20		; storing blanks
+p070Loop:	
+	sta (scr), y
+	iny
+	bne p070Loop		; new page required?
+	inc scr+1		; move to new screen page
+	lda scr+1		; check if at end of screen
+	cmp #>SCRN_MEM_END_ADDR
+	beq clearScrOut		; if so, jump out
+	lda #$20		; otherwise, store blanks again
+	jmp p070Loop
+clearScrOut:
+	rts
+
+
+;---------------------------------------------
+; p080: drawWalls: draw the outer walls on the screen
+drawWalls:
+	lda #<UPPER_WALL_START_ADDR	
+	sta scr
+	lda #>UPPER_WALL_START_ADDR
+	sta scr+1
+	lda #WALL_GRAPHIC
+	ldy #SCRN_VIS_CELLS_WIDE
+p080DrawTopLine:
+	dey			; draw the top line of the playing area
+	sta (scr), y
+	bne p080DrawTopLine
+	ldx #UPPER_WALL_HEIGHT
+p080DrawUpperLRWalls:
+	lda scr			; move to next screen line
+	clc
+	adc #SCRN_MEM_CELLS_WIDE
+	sta scr
+	bcc p080NoCarry1
+	inc scr+1
+p080NoCarry1:
+	ldy #0			; left hand edge
+	lda #WALL_GRAPHIC
+	sta (scr), y
+	ldy #SCRN_VIS_CELLS_WIDE -1; right hand edge
+	sta (scr), y
+	dex
+	bne p080DrawUpperLRWalls
+	ldx #GOAL_HEIGHT
+p080DrawGoalAreas:		; don't draw walls for several rows
+	lda scr			; - just move down 
+	clc
+	adc #SCRN_MEM_CELLS_WIDE
+	sta scr
+	bcc p080NoCarry2
+	inc scr+1
+p080NoCarry2:
+	ldy #0			; left hand edge
+	lda #GOAL_1_GRAPHIC	; LH player's goal
+	sta (scr), y
+	ldy #SCRN_VIS_CELLS_WIDE -1; right hand edge
+	lda #GOAL_2_GRAPHIC	; RH player's goal
+	sta (scr), y	
+	dex
+	bne p080DrawGoalAreas
+	ldx #LOWER_WALL_HEIGHT
+p080DrawLowerLRWalls:
+	lda scr			; move to next screen line
+	clc
+	adc #SCRN_MEM_CELLS_WIDE
+	sta scr
+	bcc p080NoCarry3
+	inc scr+1
+p080NoCarry3:
+	ldy #0			; left hand edge
+	lda #WALL_GRAPHIC
+	sta (scr), y
+	ldy #SCRN_VIS_CELLS_WIDE -1; right hand edge
+	sta (scr), y
+	dex
+	bne p080DrawLowerLRWalls	
+	lda scr			; move to next screen line
+	clc
+	adc #SCRN_MEM_CELLS_WIDE
+	sta scr
+	bcc p080NoCarry4
+	inc scr+1
+p080NoCarry4:
+	lda #WALL_GRAPHIC
+	ldy #SCRN_VIS_CELLS_WIDE
+p080DrawBottomLine:
+	dey			; draw the bottom line of the playing area
+	sta (scr), y
+	bne p080DrawBottomLine
+p080DrawCentreLine:
+	lda #<CENTRE_LINE_START_ADDR	
+	sta scr
+	lda #>CENTRE_LINE_START_ADDR
+	sta scr+1
+	ldy #0			; dummy
+	ldx #PLAY_AREA_HEIGHT
+p080CentreLineLoop:
+	lda #CENTRE_LINE_GRAPHIC
+	sta (scr), y
+	lda scr
+	clc
+	adc #SCRN_MEM_CELLS_WIDE
+	sta scr
+	bcc p080NoCarry5
+	inc scr+1
+p080NoCarry5:
+	dex
+	bne p080CentreLineLoop
+	
+drawWallsOut:
+	rts	
+	
+	
+
+;---------------------------------------------
+; p100: dispBlock: display a digit as graphics
+; beginning at the current screen address
+; scr: ZP address of screen cell with which to start
+; blockIndex: the value of the digit to be displayed
+; - value above 9 display letters for splash screens
+dispBlock:
+	txa
+	pha
+	lda blockIndex		; value of digit to display
+	asl			; multiply by 5 (no. of rows in graphic version of digit)
+	asl
+	clc
+	adc blockIndex		
+	tax
+	ldy #5			; 5 rows: set row counter
+p100Loop0:
+	tya			; store row conter on stack
+	pha
+	ldy #4			; 4 bits on each graphic row
+	lda numCharData, x
+p100Loop1:
+	lsr			; get lowest bit
+	pha			; store (partly) processed row value
+	bcc p100Zero		; pick blank or fill graphic for this cell
+	lda #NUM_GRAPHIC_1
+	jmp p100Output
+p100Zero:
+	lda #NUM_GRAPHIC_0
+p100Output:
+	sta (scr), y		; output the graphic to the cell
+	pla			; retrieve partly processed row value
+	dey			; move to the left
+	bne p100Loop1		; still bits to process
+	lda scr
+	clc
+	adc #SCRN_MEM_CELLS_WIDE; move to next screen row
+	sta scr	
+	bcc p100NoCarry
+	inc scr+1
+p100NoCarry:		
+	inx			; incrememt index into graphic array
+	pla			; row complete: retrieve row counter
+	tay
+	dey			; see if more rows to do
+	bne p100Loop0
+	
+dispBlockOut:
+	pla
+	tax
+	rts
+
+;---------------------------------------------
+; p110: dispNumber: display a 1- or 2-digit number as graphics
+; beginning at the current screen address
+; scr: ZP address of screen cell at which to start
+; numValue: value of number to be displayed
+dispNumber:
+	lda scr			; make a copy of current screen address
+	sta scr2		;
+	lda scr+1		;
+	sta scr2+1		;
+p110Tens:
+	lda #10	
+	sta divisor
+	lda numValue
+	sta dividend
+	jsr divide		; divide the remainder of the number to display by 10
+	lda quotient	
+	beq p110NoTens		; if zero, prepare to print blanks
+p110UseZero:
+	sta blockIndex
+	jmp p110DisplayTens
+p110NoTens:
+	lda #10			; 11th entry in graphics array - all blank
+	sta blockIndex
+p110DisplayTens:
+	jsr dispBlock		; display the current digit
+	lda scr2		; prepare to update the screen address from the copy
+	clc
+	adc #NUM_CELLS_WIDE	; move to space for next digit
+	sta scr			; update the screen address and the copy
+	sta scr2	
+	lda scr2+1
+	adc #0
+	sta scr+1
+	sta scr2+1
+p110Units:
+	lda remainder		; display the remainder digit (even if zero)
+	sta blockIndex
+	jsr dispBlock
+	
+dispNumberOut:
+	rts
+
+;---------------------------------------------
+; p120: updScore1: redisplay LH player score
+updScore1:
+	lda #<NUM1_START_ADDR
+	sta scr
+	lda #>NUM1_START_ADDR
+	sta scr+1
+	lda num1		; copy score to address common to both scores
+	sta numValue
+	jsr dispNumber
+updScore1Out:
+	rts
+	
+;---------------------------------------------
+; p130: updScore2: redisplay RH player score
+updScore2:
+	lda #<NUM2_START_ADDR
+	sta scr
+	lda #>NUM2_START_ADDR
+	sta scr+1
+	lda num2		; copy score to address common to both scores
+	sta numValue
+	jsr dispNumber
+updScore2Out:
+	rts
+	
+;---------------------------------------------
+; p150: ballLoop: main loop for drawing/erasing ball
+ballLoop:
+	lda traj		; find out what kind of trajectory ball should follow
+	sta currTraj		; this count will reduce as we go through this loop
+p150HorizLoop:			; ball makes 0 or more horizontal moves first
+	bne p150ProcessLoop
+	jmp p150VertMove	; if no more horizontal moves, jump to vertical move processing
+p150ProcessLoop:
+	jsr blankBall		; erase old copy of ball
+	;lda #2			; record number of cells being used for ball 
+	;sta numBallCells
+p150CalcTestAddressFor2Cell:
+	lda bScr		; copy current ball screen address from bScr
+	sec			; 
+	sbc hDir		; calculate proposed new address of ball
+	sta bScr2		; bScr -= hDir: store separately, in bScr2
+	lda bScr+1
+	sbc #0
+	sta bScr2+1
+p150CheckMove2Cell:	
+	jsr checkMove2Cell	; inspect proposed new address of ball
+	lda checkFlags		; retrieve flags
+	cmp #0			; OK to move?
+	beq p150SetNewHPos
+	cmp #1			; Wall hit?
+	beq p150InvertHDir
+	cmp #4			; Bat hit?	
+	beq p150BatHit
+	cmp #8
+	beq p150Goal1Scored
+	jmp p150Goal2Scored
+p150InvertHDir:
+	jsr invertHDir
+p150SetNewHPos:			; update address to new ball position
+	lda bScr		; bScr -= hDir
+	sec			; 
+	sbc hDir		
+	sta bScr
+	bcs p150NoBorrow1
+	dec scr+1
+	
+p150NoBorrow1:
+	jsr drawBall2		; draw the 2-cell ball
+	jsr getKeyMoveBat	; see if a key is being pressed, then possibly move a bat
+	; ### TODO:  some kind of delay loop if req'd
+	
+	jsr blankBall		; erase old copy of ball
+	;lda #1			; record number of cells being used for ball 
+	;sta numBallCells	
+	;jsr checkMove		; if about to hit upper or lower wall, change direction
+
+p150UpdateHDir2:
+	inc bScr		; bScr += 1
+	bne p150NoCarry1
+	inc bScr+1
+p150NoCarry1:
+	lda bScr		; bScr -= hDir
+	sec			; 
+	sbc hDir		
+	sta bScr
+	bcs p150NoBorrow2
+	dec scr+1	
+p150NoBorrow2:
+	jsr drawBall1		; draw the 1-cell ball
+	jsr getKeyMoveBat	; see if a key is being pressed, then possibly move a bat
+	dec currTraj		; reduce count of horizontal steps to go
+	jmp p150HorizLoop
+	; ### TODO:  some kind of delay loop if req'd
+	
+	
+p150BatHit:
+	jsr invertHDir
+	jsr setTraj		; set a new trajectory for the ball
+	ldx #0
+	jmp ballLoopOut		; jump out 
+p150Goal2Scored:
+	inc num1		; increase opponent's score
+	jsr updScore1		; update display
+	jsr startPlay		; get new trajectory and replace ball in centre
+	jmp ballLoopOut		; jump out
+p150Goal1Scored:
+	inc num2		; increase opponent's score
+	jsr updScore2		; update display
+	jsr startPlay		; get new trajectory and replace ball in centre
+	jmp ballLoopOut		; jump out
+	
+	
+p150VertMove:			; ball makes one vertical move
+	jsr blankBall		; erase old copy of ball
+	;lda #4			; record number of cells being used for ball 
+	;sta numBallCells
+p150CalcTestAddressFor4Cell:
+	lda bScr		; copy current ball screen address from bScr
+	sec
+	sbc vDir		; calculate proposed new address of ball
+	sta bScr2		; bScr -= vDir: store separately, in bScr2
+	lda bScr+1
+	sbc #0
+	sta bScr2+1
+	lda bScr2		; copy current ball screen address from bScr
+	sec			
+	sbc hDir
+	sta bScr2		; bScr -= hDir
+	lda bScr2+1
+	sbc #0
+	sta bScr2+1
+	jsr checkMove4Cell	; if about to hit wall or bat, change direction/trajectory
+	lda checkFlags		; retrieve flags
+	beq p150SetNewVHPos	; OK to move?
+p150TestHDirFlag:
+	bit bitOne		; Wall hit to L or R?
+	beq p150TestVDirFlag	; no: jump out
+	jsr invertHDir
+p150TestVDirFlag:
+	bit bitTwo		; Wall hit above or below?
+	beq p150TestBatHitFlag	; no: jump out
+	jsr invertVDir
+p150TestBatHitFlag
+	cmp #4			; Bat hit?	
+	beq p150BatHit
+	cmp #8
+	beq p150Goal1Scored
+	cmp #16
+	beq p150Goal2Scored
+p150SetNewVHPos:	
+	lda bScr		; bScr -= vDir
+	sec			; 
+	sbc vDir
+	sta bScr
+	bcs p150NoBorrow3
+	dec bScr+1
+p150NoBorrow3:
+	sec			; bScr -= hDir
+	sbc hDir
+	sta bScr
+	bcs p150NoBorrow31
+	dec bScr+1
+p150NoBorrow31:
+	jsr drawBall4		; draw the 4-cell ball
+	jsr getKeyMoveBat	; see if a key is being pressed, then possibly move a bat
+	
+	jsr blankBall		; erase old copy of ball
+	;lda #1			; record number of cells being used for ball 
+	;sta numBallCells	
+	;jsr checkMove		; if about to hit wall or bat, change direction/trajectory
+	inc bScr		; bScr += 1
+	bne p150NoCarry2
+	inc bScr+1
+p150NoCarry2:
+	lda bScr		; bScr -= hDir
+	sec			; 
+	sbc hDir		
+	sta bScr
+	bcs p150NoBorrow4
+	dec scr+1	
+p150NoBorrow4:
+	clc			; bScr += SCRN_MEM_CELLS_WIDE
+	adc #SCRN_MEM_CELLS_WIDE;
+	sta bScr
+	bcc p150NoCarry3
+	inc bScr+1
+p150NoCarry3:
+	sec			; bScr -= vDir
+	sbc vDir
+	sta bScr
+	bcs p150NoBorrow5
+	dec bScr+1
+p150NoBorrow5:
+	jsr drawBall1
+ballLoopOut:
+	rts
+	
+;---------------------------------------------
+; p151: invertHDir: invert horizontal direction of ball
+invertHDir:
+	pha
+	lda #1			; hDir = 1 - hDir
+	sec
+	sbc hDir
+	sta hDir
+	pla
+invertHDirOut:
+	rts
+	
+;---------------------------------------------
+; p153: invertVDir: invert vertical direction of ball
+invertVDir:
+	pha
+	lda #SCRN_MEM_CELLS_WIDE; vDir = SCRN_MEM_CELLS_WIDE - vDir
+	sec
+	sbc vDir
+	sta vDir
+	pla
+invertVDirOut:
+	rts
+
+;---------------------------------------------
+; p155: checkMove2Cell: inspect proposed new site of 2-cell ball
+; Proposed site is in bScr2
+checkMove2Cell:
+	lda #0
+	sta checkFlags		; initialise flags
+	ldx #2			; loop counter
+	ldy #1
+p155Loop:
+	lda (bScr2), y
+	cmp #WALL_GRAPHIC	; is the proposed new ball position occupied by the wall?
+	beq p155InvertHDir	; yes: jump out
+	cmp #BAT_1_GRAPHIC	; is the proposed new ball position occupied by the LH bat?
+	beq p155BatHit
+	cmp #BAT_2_GRAPHIC	; is the proposed new ball position occupied by the RH bat?
+	beq p155BatHit
+	cmp #GOAL_1_GRAPHIC	; is the ball in the LH goal?
+	beq p155Goal1Scored
+	cmp #GOAL_2_GRAPHIC	; is the ball in the RH goal?
+	beq p155Goal2Scored
+	dey
+	dex
+	bne p155Loop		; all cells checked?
+p155AllWell:
+	rts			; if checkFlags=0 on RTS, OK to move ball
+p155BatHit:			; choose new trajectory
+	lda #4			; set a flag to show the ball has hit a bat
+	jmp checkMove2CellOut
+p155InvertHDir:			; reverse the horizontal direction of the ball
+	lda #1			; set a flag to show the direction has been reversed
+	jmp checkMove2CellOut
+p155Goal1Scored:
+	lda #8			; set a flag to show a goal has been scored
+	jmp checkMove2CellOut	; jump out
+p155Goal2Scored:
+	lda #16			; set a flag to show a goal has been scored
+checkMove2CellOut:
+	sta checkFlags
+	rts
+	
+;---------------------------------------------
+; p157: checkMove4Cell: inspect proposed new site of 4-cell ball
+; Proposed site is in bScr2	
+checkMove4Cell:
+	lda #0
+	sta checkFlags		; initialise flags
+	sta numOfWallCells	; counter for wall cells found in each loop
+p157PrepareVDirLoop:
+	ldx #2			; loop counter
+	lda vDir
+	bne p157CheckUpper2
+p157CheckLower2:
+	ldy #SCRN_MEM_CELLS_WIDE + 1
+	jmp p157VDirLoop
+p157CheckUpper2:
+	ldy #1
+p157VDirLoop:
+	lda (bScr2), y
+	cmp #WALL_GRAPHIC	; is the proposed new ball position occupied by the wall?
+	bne p157VDirCompBat1	; no: jump out
+	inc numOfWallCells	; yes: keep a tally
+p157VDirCompBat1:
+	cmp #BAT_1_GRAPHIC	; is the proposed new ball position occupied by the LH bat?
+	beq p157BatHit
+	cmp #BAT_2_GRAPHIC	; is the proposed new ball position occupied by the RH bat?
+	beq p157BatHit
+	cmp #GOAL_1_GRAPHIC	; is the ball in the LH goal?
+	beq p157Goal1Scored
+	cmp #GOAL_2_GRAPHIC	; is the ball in the RH goal?
+	beq p157Goal2Scored
+p157VDirLoopMoveLeft:
+	dey			; move left one column
+	dex			; decrease loop counter
+	bne p157VDirLoop	; all cells checked?
+	jmp p157AllWellInVDir
+p157AllWellInVDir:		; all well in upper or lower pair of cells
+	lda numOfWallCells	; were both cells inspected part of the wall?
+	cmp #2
+	bne p157PrepareHDirLoop
+p157InvertVDir:			; reverse the vertical direction of the ball
+	lda #2			; set a flag to show the direction has been reversed
+	sta checkFlags	 	
+p157PrepareHDirLoop:
+	lda #0
+	sta numOfWallCells	; reset counter for wall cells found in each loop
+	ldx #2			; loop counter
+	lda hDir
+	bne p157CheckLeft2
+p157CheckRight2:	
+	ldy #SCRN_MEM_CELLS_WIDE + 1
+	jmp p157HDirLoop
+p157CheckLeft2:
+	ldy #SCRN_MEM_CELLS_WIDE
+p157HDirLoop:
+	lda (bScr2), y
+	cmp #WALL_GRAPHIC	; is the proposed new ball position occupied by the wall?
+	bne p157HDirCompBat1	; no: jump out
+	inc numOfWallCells	; yes: keep a tally
+p157HDirCompBat1:
+	cmp #BAT_1_GRAPHIC	; is the proposed new ball position occupied by the LH bat?
+	beq p157BatHit
+	cmp #BAT_2_GRAPHIC	; is the proposed new ball position occupied by the RH bat?
+	beq p157BatHit
+	cmp #GOAL_1_GRAPHIC	; is the ball in the LH goal?
+	beq p157Goal1Scored
+	cmp #GOAL_2_GRAPHIC	; is the ball in the RH goal?
+	beq p157Goal2Scored
+p157HDirLoopMoveUp:
+	tya
+	sec
+	sbc #SCRN_MEM_CELLS_WIDE; nove up one row
+	tay
+	dex			; decrease loop counter
+	bne p157HDirLoop	; all cells checked?
+p157AllWellInHDir:		; all well in left or right pair of cells
+	lda numOfWallCells	; were both cells inspected part of the wall?
+	cmp #2
+	bne checkMove4CellOut
+p157InvertHDir:			; reverse the horizontal direction of the ball
+	inc checkFlags		; set a flag to show the direction must be reversed
+	jmp checkMove4CellOut
+p157BatHit:			; choose new trajectory
+	lda #4			; set a flag to show the ball has hit a bat
+	jmp p157StoreFlags
+p157Goal1Scored:
+	lda #8			; set a flag to show a goal has been scored
+	jmp p157StoreFlags
+p157Goal2Scored:
+	lda #16			; set a flag to show a goal has been scored
+p157StoreFlags:
+	sta checkFlags
+checkMove4CellOut:
+	rts
+
+;---------------------------------------------
+; p199: wasteTime: waste about 20,000 cycles
+; to make game playable on a 1 MHz OSI
+wasteTime:
+ 	ldy #$6
+p199Loop: 
+	jsr wasteTimeOut
+	dex
+	bne p199Loop
+	dey
+	bne p199Loop
+wasteTimeOut:
+	rts
+		
+;---------------------------------------------
+; p200: blankBall: blank out position of ball with saved background cells
+blankBall:
+	jsr wasteTime		; slow things down so game is playable!
+	ldx numBallCells
+	ldy #0			; offset
+	lda ballSwap		; old background - cell 1
+	sta (bScr), y		; restore cell 1
+	cpx #1			; one cell only?
+	beq blankBallOut	; yes: jump out
+	iny			; move to adjacent cell
+	lda ballSwap+1		; old background - cell 2
+	sta (bScr), y		; restore second cell
+	cpx #2			; two cells only?
+	beq blankBallOut	; yes: jump out
+	tya
+	clc
+	adc #SCRN_MEM_CELLS_WIDE - 1; move to adjacent screen row, one cell to left
+	tay
+	lda ballSwap+2		; old background - cell 3
+	sta (bScr), y		; restore third cell
+	iny			; move to adjacent cell
+	lda ballSwap+3		; old background - cell 4
+	sta (bScr), y		; restore fourth cell
+blankBallOut:
+	rts
+	
+;---------------------------------------------
+; p210: drawBall1: draw ball with 1 cell
+drawBall1:
+	lda #1			; record number of cells being used
+	sta numBallCells	
+	ldy #0
+	lda (bScr), y		; save background behind ball
+	sta ballSwap
+	lda ball1		; get single-cell ball character
+	sta (bScr), y
+drawBall1Out:
+	rts
+
+;---------------------------------------------
+; p220: drawBall2: draw ball with 2 cells
+drawBall2:
+	lda #2			; record number of cells being used
+	sta numBallCells	
+	ldy #0
+	lda (bScr), y		; save background behind ball - cell 1
+	sta ballSwap
+	lda ball2		; get first double-cell ball character
+	sta (bScr), y
+	iny
+	lda (bScr), y		; save background behind ball - cell 2
+	sta ballSwap+1
+	lda ball2+1		; get second double-cell ball character
+	sta (bScr), y
+drawBall2Out:
+	rts
+
+;---------------------------------------------
+; p230: drawBall4: draw ball with 4 cells
+drawBall4:
+	lda #4			; record number of cells being used
+	sta numBallCells	
+	ldy #0
+	lda (bScr), y		; save background behind ball - cell 1
+	sta ballSwap
+	lda ball4		; get first 4-cell ball character
+	sta (bScr), y
+	iny
+	lda (bScr), y		; save background behind ball - cell 2
+	sta ballSwap+1
+	lda ball4+1		; get second 4-cell ball character
+	sta (bScr), y
+	tya
+	clc
+	adc #SCRN_MEM_CELLS_WIDE - 1; move to adjacent screen row, one cell to left
+	tay
+	lda (bScr), y		; save background behind ball - cell 3
+	sta ballSwap+2
+	lda ball4+2		; get third 4-cell ball character
+	sta (bScr), y
+	iny
+	lda (bScr), y		; save background behind ball - cell 4
+	sta ballSwap+3
+	lda ball4+3		; get final 4-cell ball character
+	sta (bScr), y
+drawBall4Out:
+	rts	
+	
+;---------------------------------------------
+; p300: drawBat: draw a bat as vertical line of graphic cells,
+; or blank it out (set batGraphic to 32)
+drawBat:
+	ldy #0
+	ldx batSize		; number of cells to extend bat above and below starting cell
+	lda tScr		; make a copy of the bat start address
+	sta tScr2
+	lda tScr+1
+	sta tScr2+1
+p300Loop:
+	lda batGraphic		
+	sta (tScr), y		; store the bat graphic in cells going
+	sta (tScr2), y		; up and down from the bat's starting cell
+	lda tScr		; increase one copy of the address by one line
+	clc
+	adc #SCRN_MEM_CELLS_WIDE
+	sta tScr
+	bcc p300NoCarry
+	inc tScr+1
+p300NoCarry:
+	lda tScr2		; decrease the other copy of the address by one line
+	sec
+	sbc #SCRN_MEM_CELLS_WIDE
+	sta tScr2
+	bcs p300NoBorrow
+	dec tScr2+1
+p300NoBorrow:
+	dex
+	bpl p300Loop
+drawBatOut:
+	rts 
+
+;---------------------------------------------
+; p310: drawBat1: draw / blank LH bat 
+; Draws if X = 1, blanks otherwise
+drawBat1:
+	cpx #1
+	beq p310Draw
+p310Blank:
+	lda t1Scr
+	sta tScr
+	lda t1Scr+1
+	sta tScr+1
+	lda #32
+	sta batGraphic		; blank 
+	jsr drawBat
+	rts
+p310Draw:
+	lda t1Scr
+	sta tScr
+	lda t1Scr+1
+	sta tScr+1
+	lda #BAT_1_GRAPHIC	; redraw with graphic character
+	sta batGraphic
+	jsr drawBat
+drawBat1Out:
+	rts
+	
+;---------------------------------------------
+; p320: drawBat2: draw / blank RH bat 
+drawBat2:
+	cpx #1
+	beq p320Draw
+p320Blank:
+	lda t2Scr
+	sta tScr
+	lda t2Scr+1
+	sta tScr+1
+	lda #32
+	sta batGraphic		; blank 
+	jsr drawBat
+	rts
+p320Draw:
+	lda t2Scr
+	sta tScr
+	lda t2Scr+1
+	sta tScr+1
+	lda #BAT_2_GRAPHIC	; redraw with graphic character
+	sta batGraphic
+	jsr drawBat
+drawBat2Out:
+	rts
+
+;---------------------------------------------
+; p330: lhBatUp: check whether LH bat can move up, 
+; and if so, move and redraw it. 
+lhBatUp:
+	lda t1Scr+1		; compare high byte
+	cmp #>LH_BAT_MIN_ADDR	; with min allowed
+	bcc lhBatUpOut		; A < HB
+	bne p330OKToMove	; A > HB: move allowed		
+	lda t1Scr		; high byte the same as min allowed
+	cmp #<LH_BAT_MIN_ADDR	; compare low byte with min allowed
+	beq lhBatUpOut		; address is at minimum: jump out
+p330OKToMove:
+	ldx #0
+	jsr drawBat1		; blank out old position of bat
+	lda t1Scr
+	sec			; OK to move, so
+	sbc #SCRN_MEM_CELLS_WIDE; subtract a row from address
+	sta t1Scr
+	bcs p330DrawBat
+	dec t1Scr+1
+p330DrawBat:
+	ldx #1
+	jsr drawBat1		; draw bat at new position
+lhBatUpOut:
+	rts
+	
+;---------------------------------------------
+; p340: lhBatDown: check whether LH bat can move down, 
+; and if so, move and redraw it. 
+lhBatDown:
+	lda t1Scr+1		; compare high byte
+	cmp #>LH_BAT_MAX_ADDR	; with max allowed
+	bcc p340OKToMove	; A < HB: move allowed
+	bne lhBatDownOut	; A > HB		
+	lda t1Scr		; high byte the same as max allowed
+	cmp #<LH_BAT_MAX_ADDR	; compare low byte with max allowed
+	beq lhBatDownOut	; address is at maximum: jump out
+p340OKToMove:
+	ldx #0
+	jsr drawBat1		; blank out old position of bat
+	lda t1Scr
+	clc			; OK to move, so
+	adc #SCRN_MEM_CELLS_WIDE; add a row to address
+	sta t1Scr
+	bcc p340DrawBat
+	inc t1Scr+1
+p340DrawBat:
+	ldx #1
+	jsr drawBat1		; draw bat at new position
+lhBatDownOut:
+	rts
+	
+;---------------------------------------------
+; p350: rhBatUp: check whether RH bat can move up, 
+; and if so, move and redraw it. 
+rhBatUp:
+	lda t2Scr+1		; compare high byte
+	cmp #>RH_BAT_MIN_ADDR	; with min allowed
+	bcc rhBatUpOut		; A < HB
+	bne p350OKToMove	; A > HB: move allowed		
+	lda t2Scr		; high byte the same as min allowed
+	cmp #<RH_BAT_MIN_ADDR	; compare low byte with min allowed
+	beq rhBatUpOut		; address is at minimum: jump out
+p350OKToMove:
+	ldx #0
+	jsr drawBat2		; blank out old position of bat
+	lda t2Scr
+	sec			; OK to move, so
+	sbc #SCRN_MEM_CELLS_WIDE; subtract a row from address
+	sta t2Scr
+	bcs p350DrawBat
+	dec t2Scr+1
+p350DrawBat:
+	ldx #1
+	jsr drawBat2		; draw bat at new position
+rhBatUpOut:
+	rts
+	
+;---------------------------------------------
+; p360: rhBatDown: check whether RH bat can move down, 
+; and if so, move and redraw it. 
+rhBatDown:
+	lda t2Scr+1		; compare high byte
+	cmp #>RH_BAT_MAX_ADDR	; with max allowed
+	bcc p360OKToMove	; A < HB: move allowed
+	bne rhBatDownOut	; A > HB		
+	lda t2Scr		; high byte the same as max allowed
+	cmp #<RH_BAT_MAX_ADDR	; compare low byte with max allowed
+	beq rhBatDownOut	; address is at maximum: jump out
+p360OKToMove:
+	ldx #0
+	jsr drawBat2		; blank out old position of bat
+	lda t2Scr
+	clc			; OK to move, so
+	adc #SCRN_MEM_CELLS_WIDE; add a row to address
+	sta t2Scr
+	bcc p360DrawBat
+	inc t2Scr+1
+p360DrawBat:
+	ldx #1
+	jsr drawBat2		; draw bat at new position
+rhBatDownOut:
+	rts
+	
+;---------------------------------------------
+; p400: keybPoll: scan relevant keys of OSI keyboard
+; Scans for four keys (two for each player)
+; and moves a bat if required. 
+; See "The Challenger Character Graphics Reference Manual", p.12.
+keybPoll:
+p400TryLHUp:
+	lda #LH_BAT_UP_ROW	; select OSI 600 row 
+	sta $DF00		; activate that row
+	lda $DF00		; read keyboard row
+	cmp #LH_BAT_UP_COL	; switch on sought column closed?
+	bne p400TryLHDown	; no: jump out
+	ldx #LH_BAT_UP_ASC	; store ASC value
+	rts
+p400TryLHDown:
+	lda #LH_BAT_DOWN_ROW	; select OSI 600 row 
+	sta $DF00		; activate that row
+	lda $DF00		; read keyboard row
+	cmp #LH_BAT_DOWN_COL	; switch on sought column closed?
+	bne p400TryRHUp		; no: jump out
+	ldx #LH_BAT_DOWN_ASC	; store ASC value
+	rts
+p400TryRHUp:
+	lda #RH_BAT_UP_ROW	; select OSI 600 row 
+	sta $DF00		; activate that row
+	lda $DF00		; read keyboard row
+	cmp #RH_BAT_UP_COL	; switch on sought column closed?
+	bne p400TryRHDown	; no: jump out
+	ldx #RH_BAT_UP_ASC	; store ASC value
+	rts
+p400TryRHDown:
+	lda #RH_BAT_DOWN_ROW	; select OSI 600 row 
+	sta $DF00		; activate that row
+	lda $DF00		; read keyboard row
+	cmp #RH_BAT_DOWN_COL	; switch on sought column closed?
+	bne p400TrySpace	; no: jump out
+	ldx #RH_BAT_DOWN_ASC	; store ASC value
+	rts
+p400TrySpace:
+	lda #253		; select OSI 600 row 
+	sta $DF00		; activate that row
+	lda $DF00		; read keyboard row
+	cmp #239		; switch on column 4 (Space) closed?
+	bne p400TryRubOut	; no: jump out
+	ldx #32			; store a space
+	rts
+p400TryRubOut:
+	lda #191		; select OSI 600 row 
+	sta $DF00		; activate that row
+	lda $DF00		; read keyboard row
+	cmp #251		; switch on column 2 (Rub Out) closed?
+	bne p400NoKey		; no: jump out
+	ldx #95			; store a Rub Out
+	rts
+p400NoKey:
+	ldx #0
+keybPollOut:
+	rts
+	
+;---------------------------------------------
+; p410: getKeyMoveBat: call keyboard poll method
+; and take action based on response
+getKeyMoveBat:
+	jsr keybPoll
+p410TryLHUp:
+	cpx #LH_BAT_UP_ASC	; key pressed for bat move?
+	bne p410TryLHDown	; no: jump out
+	jsr lhBatUp		; move bat
+	rts
+p410TryLHDown:
+	cpx #LH_BAT_DOWN_ASC	; key pressed for bat move?
+	bne p410TryRHUp		; no: jump out
+	jsr lhBatDown		; move bat
+	rts
+p410TryRHUp:
+	cpx #RH_BAT_UP_ASC	; key pressed for bat move?
+	bne p410TryRHDown	; no: jump out
+	jsr rhBatUp		; move bat
+	rts
+p410TryRHDown:
+	cpx #RH_BAT_DOWN_ASC	; key pressed for bat move?
+	bne getKeyMoveBatOut	; no: jump out
+	jsr rhBatDown		; move bat
+	rts
+getKeyMoveBatOut:
+	rts
+
+;---------------------------------------------
+; p500: divide: divide one 8-bit number by another
+divide:
+	lda #0			; initialise A 
+	sta quotient		; initialise result
+	ldx #08			; initialise bit counter
+p500Loop:
+	asl dividend		; double dividend
+	rol			; double A and add carry into it
+	cmp divisor		; compare A with divisor
+	php			; store flags
+	rol quotient		; double quotient and add carry into it
+	plp			; retrieve flags
+	bcc p500NoSbc		; if divisor > A, cannot subtract
+	sbc divisor		; divisor <= A, so subtract
+p500NoSbc:
+	dex			; decrease bit counter
+	bne p500Loop		; if still bits to process, jump back
+	sta remainder		; end of loop: A holds remainder, so store it
+divideOut:
+	rts
+
+;-------------- END OF ASSEMBLY CODE -------------
+
+;----------------- READ-ONLY DATA ----------------
+
+numCharData:			; values for large numerals
+	.DB 7,5,5,5,7,1,3,1,1,1,7,1,7,4,7,7,1,7,1,7,5,5,7,1,1
+	.DB 7,4,7,1,7,7,4,7,5,7,7,1,1,1,1,7,5,7,5,7,7,5,7,1,7
+	.DB 0,0,0,0,0
+splashData:			
+	.DB 7,5,7,4,4,2,2,2,0,0,7,5,5,0,0,3,2,3,0,3,8,8,8,8,8 			; 'ping' 
+gameOverData:			
+	.DB 7,5,7,1,7,7,1,7,5,7,7,5,5,5,5,13,5,5,5,5,12,4,12,0,12 		; 'game'
+	.DB 3,2,2,2,3,10,10,10,10,9,11,10,11,10,3,11,10,10,2,10,8,0,0,0,0	; 'over'
+instrMsg:
+	.DB "Press SPACE to start", 0
+splashMsg:
+	.DB "(C) 2022 David Nelson", 0
+bitOne .DB 01			; for bitwise testing
+bitTwo .DB 02
+
+;-------------- OSI 600-specific graphics ---------
+
+ball1	.DB BALL_WHOLE_GRAPHIC			
+ball2	.DB BALL_LH_GRAPHIC, BALL_RH_GRAPHIC
+ball4	.DB BALL_Q1_GRAPHIC, BALL_Q2_GRAPHIC, BALL_Q3_GRAPHIC, BALL_Q4_GRAPHIC
+
+;------------- OSI 600-specific graphics END ------
+	
+;----------------- READ-ONLY DATA END -------------
+
+;-------------------- LISTING END -----------------
+
+
+	
+	
